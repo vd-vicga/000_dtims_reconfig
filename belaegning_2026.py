@@ -36,6 +36,7 @@ WORKBOOK = ROOT / "Nye belægninger på kørebaner i 2026.xlsx"
 CACHE = ROOT / "_linear_cache"
 EXCEL_WKT_LIMIT = 32000
 MATCH_DISTANCE_M = 15.0
+KEEP_VEJDEL = {"0", "1", "2"}
 
 SIDES = {
     "Højre": {"tpe": 1, "lane": 1, "code": "R"},
@@ -587,6 +588,64 @@ def base_piece(feature, low_m, high_m):
     return piece
 
 
+def accept_on_base(scored, paving):
+    accepted = []
+    for gap, feature in scored:
+        located = measures_against(
+            feature["line"], feature["meas_from"], feature["meas_to"], paving
+        )
+        if located is None:
+            continue
+        low_m, high_m = located
+        low_c, high_c = sorted((to_chain(feature, low_m), to_chain(feature, high_m)))
+        overlaps = any(
+            min(high_c, item["chain_to"]) - max(low_c, item["chain_from"]) > 1
+            for item in accepted
+        )
+        if overlaps:
+            continue
+        accepted.append(
+            {
+                "gap": gap,
+                "feature": feature,
+                "meas_from": low_m,
+                "meas_to": high_m,
+                "chain_from": low_c,
+                "chain_to": high_c,
+            }
+        )
+    return accepted
+
+
+def split_on_sections(base_events, route_sections):
+    events = []
+    for event in base_events:
+        chain_span = event["to"] - event["from"]
+        measure_span = event["measure_to"] - event["measure_from"]
+        scale = measure_span / chain_span if chain_span > 0 else 1.0
+        feature = event["feature"]
+        for section in route_sections:
+            low = max(event["from"], section["from"])
+            high = min(event["to"], section["to"])
+            if high - low <= 0.5:
+                continue
+            low_m = event["measure_from"] + (low - event["from"]) * scale
+            high_m = event["measure_from"] + (high - event["from"]) * scale
+            events.append(
+                {
+                    "base_id": event["base_id"],
+                    "gid": section["gid"],
+                    "name": section["name"],
+                    "from": low,
+                    "to": high,
+                    "measure_from": low_m,
+                    "measure_to": high_m,
+                    "geom": base_piece(feature, low_m, high_m),
+                }
+            )
+    return events
+
+
 def assign_measures(records, base_features, sections, has_geometry):
     grouped = {}
     for feature in base_features:
@@ -596,6 +655,8 @@ def assign_measures(records, base_features, sections, has_geometry):
     for record in records:
         record.update(
             {
+                "pms_lane": record["lane"],
+                "pms_match": None,
                 "base_events": [],
                 "pms_events": [],
                 "base_id": None,
@@ -620,31 +681,15 @@ def assign_measures(records, base_features, sections, has_geometry):
                     scored.append((gap, feature))
         scored.sort(key=lambda item: item[0])
 
-        accepted = []
-        for gap, feature in scored:
-            located = measures_against(
-                feature["line"], feature["meas_from"], feature["meas_to"], paving
-            )
-            if located is None:
-                continue
-            low_m, high_m = located
-            low_c, high_c = sorted((to_chain(feature, low_m), to_chain(feature, high_m)))
-            overlaps = any(
-                min(high_c, item["chain_to"]) - max(low_c, item["chain_from"]) > 1
-                for item in accepted
-            )
-            if overlaps:
-                continue
-            accepted.append(
-                {
-                    "gap": gap,
-                    "feature": feature,
-                    "meas_from": low_m,
-                    "meas_to": high_m,
-                    "chain_from": low_c,
-                    "chain_to": high_c,
-                }
-            )
+        accepted = accept_on_base(scored, paving)
+        if not accepted and paving is not None and has_geometry:
+            loose = [
+                (mean_distance(paving, feature["line"]), feature)
+                for feature in candidates
+                if feature["line"] is not None
+            ]
+            loose.sort(key=lambda item: item[0])
+            accepted = accept_on_base(loose, paving)
 
         if not accepted:
             continue
@@ -674,34 +719,24 @@ def assign_measures(records, base_features, sections, has_geometry):
                 }
             )
 
-        route_sections = sections.get((record["roadname"], record["lane"]), [])
-        pms_names = []
-        for event in record["base_events"]:
-            chain_span = event["to"] - event["from"]
-            measure_span = event["measure_to"] - event["measure_from"]
-            scale = measure_span / chain_span if chain_span > 0 else 1.0
-            feature = event["feature"]
-            for section in route_sections:
-                low = max(event["from"], section["from"])
-                high = min(event["to"], section["to"])
-                if high - low <= 0.5:
-                    continue
-                low_m = event["measure_from"] + (low - event["from"]) * scale
-                high_m = event["measure_from"] + (high - event["from"]) * scale
-                pms_names.append(section["name"])
-                record["pms_events"].append(
-                    {
-                        "base_id": event["base_id"],
-                        "gid": section["gid"],
-                        "name": section["name"],
-                        "from": low,
-                        "to": high,
-                        "measure_from": low_m,
-                        "measure_to": high_m,
-                        "geom": base_piece(feature, low_m, high_m),
-                    }
-                )
-        record["pms_sections"] = ", ".join(dict.fromkeys(pms_names)) or None
+        events = split_on_sections(
+            record["base_events"], sections.get((record["roadname"], record["lane"]), [])
+        )
+        if events:
+            record["pms_match"] = "vejside"
+        elif record["admvejdel"] in ("1", "2"):
+            fallback_lane = int(record["admvejdel"])
+            events = split_on_sections(
+                record["base_events"],
+                sections.get((record["roadname"], fallback_lane), []),
+            )
+            if events:
+                record["pms_lane"] = fallback_lane
+                record["pms_match"] = "vejdel"
+        record["pms_events"] = events
+        record["pms_sections"] = (
+            ", ".join(dict.fromkeys(event["name"] for event in events)) or None
+        )
 
     print(f"Stedfæstet {matched} af {len(records)} belægninger på base", flush=True)
     pms_rows = sum(len(record["pms_events"]) for record in records)
@@ -743,7 +778,9 @@ def create_tables(cursor):
             measure_to double precision,
             match_distance_m double precision,
             base_element_count integer NOT NULL,
-            pms_section_count integer NOT NULL
+            pms_section_count integer NOT NULL,
+            pms_lane smallint NOT NULL,
+            pms_match text
         );
         CREATE TABLE dtims.nye_belaegninger_2026_base (
             id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -835,6 +872,8 @@ def insert_records(cursor, records):
             record["match_distance_m"],
             len(record["base_events"]),
             len(record["pms_events"]),
+            record["pms_lane"],
+            record["pms_match"],
         )
         for record in records
     ]
@@ -846,14 +885,14 @@ def insert_records(cursor, records):
             udlaegningsdato, vejside, tpe_vejside, plade_tpe, oeverste_lag,
             roadname, lane, side_code, geom, base_id, base_name,
             chain_from, chain_to, measure_from, measure_to, match_distance_m,
-            base_element_count, pms_section_count
+            base_element_count, pms_section_count, pms_lane, pms_match
         ) VALUES %s
         """,
         parent_rows,
         template="""(
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
             ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_SetSRID(ST_GeomFromText(%s), 25832)), 2)),
-            %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         )""",
         page_size=40,
     )
@@ -890,7 +929,7 @@ def insert_records(cursor, records):
                     int(event["gid"]) if event["gid"] is not None else None,
                     event["name"],
                     record["roadname"],
-                    record["lane"],
+                    record["pms_lane"],
                     event["from"],
                     event["to"],
                     event["measure_from"],
@@ -952,9 +991,14 @@ def load_database(records):
                     f"{sum(len(items) for items in sections.values())} sektioner",
                     flush=True,
                 )
-                assign_measures(records, base_features, sections, True)
+                kept = [record for record in records if record["admvejdel"] in KEEP_VEJDEL]
+                print(
+                    f"{len(kept)} af {len(records)} rækker har vejdel {', '.join(sorted(KEEP_VEJDEL))}.",
+                    flush=True,
+                )
+                assign_measures(kept, base_features, sections, True)
                 create_tables(cursor)
-                insert_records(cursor, records)
+                insert_records(cursor, kept)
                 cursor.execute(
                     """
                     SELECT count(*), count(geom), count(measure_from),

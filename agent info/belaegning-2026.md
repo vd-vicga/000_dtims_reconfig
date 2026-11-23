@@ -138,3 +138,17 @@ Retningen på base-linjen er antaget, ikke bevist. Længden af de klippede hænd
 Op til 7 belægninger kan ligge på samme sektion. Det er flere udlægninger på samme sted, ikke en fejl i opdelingen.
 
 `base.id` kan gå igen på flere gid-rækker. Hændelserne peger på den id, der blev ramt, sammen med det konkrete from/to-interval.
+
+## Vejdel som fallback på pms (23. november 2026)
+
+I pms_analysis har vejdel 1 kun lane 1 (R), og vejdel 2 kun lane 2 (L). Alle 40 belægninger med vejdel 1 eller 2 står i det oprindelige ark som vejside Midt (lane 0) og ramte derfor ingen sektioner.
+
+Scriptet matcher først på vejnavn og lane fra vejside. Giver det ingen sektion, og vejdelen er 1 eller 2, bruges vejdelen som lane. `nye_belaegninger_2026.lane` er stadig vejsidens lane. `pms_lane` er den lane, der blev brugt til pms, og `pms_match` er `vejside` eller `vejdel`. Lane i `nye_belaegninger_2026_pms` er pms-lanen.
+
+Rækker uden base-match fik en ekstra chance: kandidater på samme vej accepteres, når mindst to punkter på belægningen ligger inden for 15 m af base-linjen. Det stedfæstede 11-2, 30-2, 50-1 og 61-1.
+
+Scriptet læser kun rækker med vejdel 0, 1 og 2 ind i databasen.
+
+Resultat: 409 belægninger på base, 414 hændelser på base, 417 på pms (218 belægninger). 40 er matchet via vejdel.
+
+Overlap i `pms_analysis_belaegning_overlap` er den del af sektionen, der ligger inden for 15 m af belægningens linear search-linje på samme vej og `pms_lane`. 307 sektioner har overlap, 59 har 100 %.
